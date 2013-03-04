@@ -3,8 +3,15 @@
 require 'nokogiri'
 require 'yaml'
 
+require 'onix_code_list'
+require 'onix_exception'
+
 class NilClass
   def %(_)
+    nil
+  end
+
+  def /(_)
     nil
   end
 
@@ -13,47 +20,68 @@ class NilClass
   end
 end
 
+#noinspection RubyTooManyMethodsInspection,RubyHashKeysTypesInspection
 class OnixRecord
 
   def initialize(options = {})
+    @lists = {}
     options.merge!({index: 0}) { |_, v1, _| v1 }
     filename = options[:filename]
-    raise 'No filename supplied' unless filename
+    raise OnixException.new(100, 'No filename supplied') unless filename
     doc = Nokogiri::XML::Document.parse(open(filename))
-    raise "Cannot open XML document '#{filename}'" unless doc
-    raise 'Not an ONIX document' unless doc.root.name == 'ONIXMessage'
-    raise 'Not a ONIX 2.1 document' unless doc.root.namespace.href == 'http://www.editeur.org/onix/2.1/reference'
+    raise OnixException(101, "Cannot open XML document '#{filename}'") unless doc
+    raise OnixException(102, 'Not an ONIX document') unless doc.root.name == 'ONIXMessage'
+    raise OnixException(103, 'Not a ONIX 2.1 document') unless doc.root.namespace.href == 'http://www.editeur.org/onix/2.1/reference'
     @header = doc.root % 'Header'
     @product = doc.root / 'Product'
     if @product.is_a? Nokogiri::XML::NodeSet
       @product = @product[options[:index]]
     else
-      raise "Product information ##{options[:index]} not found in '#{filename}'"
+      raise OnixException(104, "Product information ##{options[:index]} not found in '#{filename}'")
     end
   end
 
+  def list
+    puts "File type:    #{epub_type}"
+    puts "ISBN:         #{isbn}"
+    puts "Title:        #{main_title}"
+    (titles - [main_title]).each do |title|
+      puts "            - #{title}"
+    end
+    puts "Publication:  #{publication_date} (#{publication_year})"
+    puts "Publisher:    #{main_publisher}"
+    (publishers - [main_publisher]).each do |publisher|
+      puts "            - #{publisher}"
+    end
+    puts "Authors:      #{authors.join '; '}"
+    puts 'Contributors: '
+    contributors.each do |_, val|
+      puts "   - #{val[:description]}: #{val[:values].join '; '}"
+    end
+    puts "Genres:        #{genres.join '; '}"
+    puts "Categories:    #{categories.join '; '}"
+    puts "Themes:        #{themes.join '; '}"
+    puts "Keywords:      #{keywords.join '; '}"
+    puts 'Main subjects:'
+    main_subject_list.each do |k,v|
+      puts "   - #{OnixCodeList.value('List26',k)}: #{v.join '; '}"
+    end
+    puts 'Subjects:'
+    subject_list.each do |k,v|
+      puts "   - #{OnixCodeList.value('List27',k)}: #{v.join '; '}"
+    end
+    puts "Audience:      #{audience.join '; '}"
+    puts 'Summary:'
+    summary.each { |s| puts s; puts '----------' }
+  end
+
   def epub_type
-    case (@product % 'EpubType').text
-      when '002'
-        'PDF'
-      when '025'
-        'TXT'
-      when '029'
-        'EPUB'
-      else
-        ''
+    value = []
+    if (p = @product % 'EpubType')
+      value << OnixCodeList.value('List10', p.text)
     end
-    +
-    case (@product % 'EpubTypeVersion').text
-      when '0'
-        ''
-      when '3'
-        '_DRM'
-      when '2'
-        '_DW'
-      else
-        ''
-    end
+    value << (@product % 'EpubTypeVersion').text if @product % 'EpubTypeVersion'
+    value.join ' '
   end
 
   def isbn
@@ -64,12 +92,19 @@ class OnixRecord
   end
 
   def main_title
-    title_list[1][0]
+    title_list['01'][0]
   end
 
   def titles
-    #noinspection RubyHashKeysTypesInspection
     Hash[title_list.sort].values.flatten
+  end
+
+  def publication_date
+    (@product % 'PublicationDate').text
+  end
+
+  def publication_year
+    publication_date[0..3]
   end
 
   def main_publisher
@@ -80,96 +115,96 @@ class OnixRecord
     publisher_list
   end
 
+  def contributors
+    contributor_list
+  end
+
   def authors
-    #noinspection RubyHashKeysTypesInspection
-    Hash[contributor_list['A01'].sort].values.flatten
+    #noinspection RubyArgCount
+    contributor_list.select do |key, _|
+      %w(A01 A02 A12 A13).include? key
+    end.collect { |_, v| v[:values] }.flatten
   end
 
-  def illustrators
-    #noinspection RubyHashKeysTypesInspection
-    Hash[contributor_list['A12'].sort].values.flatten
+  def main_subjects
+    main_subject_list.collect { |_, v| v }.flatten
   end
 
-  def editors
-    #noinspection RubyHashKeysTypesInspection
-    Hash[contributor_list['B01'].sort].values.flatten
+  def subjects
+    subject_list.collect { |_, v| v }.flatten
   end
 
-  def adaptors
-    #noinspection RubyHashKeysTypesInspection
-    Hash[contributor_list['B05'].sort].values.flatten
+  def genres
+    []
   end
 
-  def translators
-    #noinspection RubyHashKeysTypesInspection
-    Hash[contributor_list['B06'].sort].values.flatten
+  def categories
+    []
+  end
+
+  def themes
+    []
+  end
+
+  def keywords
+    main_subject_list['20']
+  end
+
+  def audience
+    audience_list
+  end
+
+  def summary
+    text_list['03'][:values]
   end
 
 #  :private
 
   def identifier_list
-    return @identifier_list if @identifier_list
-    @identifier_list = Hash.new []
+    return @lists[:identifier] if @lists[:identifier]
+    @lists[:identifier] = Hash.new []
     (@product / 'ProductIdentifier').each do |id|
       id_type = (id % 'ProductIDType').text.to_i
       id_value = (id % 'IDValue').text
-      v = @identifier_list[id_type].dup
+      v = @lists[:identifier][id_type].dup
       v << id_value
-      @identifier_list[id_type] = v
+      @lists[:identifier][id_type] = v
     end
-    @identifier_list
+    @lists[:identifier]
   end
 
   def publisher_list
-    return @publisher_list if @publisher_list
-    @publisher_list = []
+    return @lists[:publisher] if @lists[:publisher]
+    @lists[:publisher] = []
     (@product / 'Publisher').each do |pub|
-      @publisher_list << (pub % 'PublisherName').text
+      @lists[:publisher] << (pub % 'PublisherName').text
     end
-    @publisher_list
+    @lists[:publisher]
   end
 
   def title_list
-    return @title_list if @title_list
-    @title_list = Hash.new []
+    return @lists[:title] if @lists[:title]
+    @lists[:title] = Hash.new []
     (@product / 'Title').each do |t|
-      t_type = (t % 'TitleType').text.to_i
+      t_type = (t % 'TitleType').text
       t_value = (t % 'TitleText').text
-      v = @title_list[t_type].dup
+      v = @lists[:title][t_type].dup
       v << t_value
-      @title_list[t_type] = v
+      (t / 'Subtitle').each { |s| v << s.text }
+      @lists[:title][t_type] = v
     end
-    @title_list
-  end
-
-  def subject_list
-    return @subject_list if @subject_list
-    @subject_list = Hash.new []
-    (@product / 'Subject').each do |s|
-      s_type = (s % 'SubjectSchemeIdentifier').text.to_i
-      s_value = s % 'SubjectHeadingText' ? (s % 'SubjectHeadingText').text : lookup_subject(s_type, (s % 'SubjectCode').text)
-      v = @subject_list[s_type].dup
-      v << s_value
-      @subject_list[s_type] = v
-    end
-    @subject_list
-  end
-
-  def lookup_subject(schema, code)
-    case schema
-      when 32
-        nur_table = YAML::open('nur.yml')
-        nur_table[code.to_i]
-      else
-        nil
-    end
+    @lists[:title]
   end
 
   def contributor_list
-    return @contributor_list if @contributor_list
-    @contributor_list = Hash.new(Hash.new([]))
+    return @lists[:contributor] if @lists[:contributor]
+    list = Hash.new()
     (@product / 'Contributor').each do |c|
       c_type = (c % 'ContributorRole').text
+      c_type_text = OnixCodeList.value('List17', c_type)
+      c_type_name = c_type_text.gsub /[()]/, ''
+      c_type_name.downcase!
+      c_type_name.gsub! /\s/, '_'
       c_value = ''
       c_value = (c % 'PersonName').text if (c % 'PersonName')
       c_value = (c % 'PersonNameInverted').text if (c % 'PersonNameInverted')
@@ -186,20 +221,88 @@ class OnixRecord
             (c % 'LettersAfterNames').text,
             (c % 'TitlesAfterNames').text
         ].join(' ')
-        c_value.gsub!(/\s+/,' ')
+        c_value.gsub!(/\s+/, ' ')
         c_value.strip!
       end
-      c_index = 9999
+      c_index = 999
       if (i = c % 'SequenceNumberWithinRole')
         c_index = i.text.to_i
       end
-      v = @contributor_list[c_type].dup
-      x = v[c_index].dup
+      v = list.has_key?(c_type) ? list[c_type][:values] : {}
+      x = v.has_key?(c_index) ? v[c_index] : []
       x << c_value
       v[c_index] = x
-      @contributor_list[c_type] = v
+      list[c_type] = {name: c_type_name, description: c_type_text, values: v}
     end
-    @contributor_list
+    @lists[:contributor] = list.sort.each_with_object({}) do |pair, obj|
+      obj[pair.first] = {
+          name: pair.last[:name],
+          description: pair.last[:description],
+          values: Hash[pair.last[:values].sort].values.flatten
+      }
+    end
+    @lists[:contributor]
+  end
+
+  def subject_list
+    return @lists[:subject] if @lists[:subject]
+    @lists[:subject] = Hash.new []
+    (@product / 'Subject').each do |s|
+      s_type = (s % 'SubjectSchemeIdentifier').text
+      s_value = s % 'SubjectHeadingText' ? (s % 'SubjectHeadingText').text : OnixCodeList.lookup_subject(s_type, (s % 'SubjectCode').text)
+      v = @lists[:subject][s_type].dup
+      v << s_value
+      @lists[:subject][s_type] = v
+    end
+    @lists[:subject]
+  end
+
+  def main_subject_list
+    return @lists[:main_subject] if @lists[:main_subject]
+    @lists[:main_subject] = Hash.new []
+    (@product / 'MainSubject').each do |s|
+      s_type = (s % 'MainSubjectSchemeIdentifier').text
+      s_value = s % 'SubjectHeadingText' ? (s % 'SubjectHeadingText').text : OnixCodeList.lookup_subject(s_type, (s % 'SubjectCode').text)
+      v = @lists[:main_subject][s_type].dup
+      v << s_value
+      @lists[:main_subject][s_type] = v
+    end
+    @lists[:main_subject]
+  end
+
+  def audience_list
+    return @lists[:audience] if @lists[:audience]
+    @lists[:audience] = []
+    (@product / 'AudienceCode').each do |code|
+      @lists[:audience] << OnixCodeList.value('List28', code)
+    end
+    (@product / 'Audience').each do |audience|
+      @lists[:audience] << OnixCodeList.lookup_audience(
+          (audience % 'AudienceCodeType').text,
+          (audience % 'AudienceCodeValue').text
+      )
+    end
+    @lists[:audience]
+  end
+
+  def text_list
+    return @lists[:text] if @lists[:text]
+    @lists[:text] = Hash.new( { description: '', values: [] } )
+    (@product / 'OtherText').each do |other_text|
+      t_type_code = (other_text % 'TextTypeCode').text
+      t_type = OnixCodeList.value('List33', t_type_code)
+      (other_text / 'Text').each do |text|
+        v = @lists[:text][t_type_code].dup
+        v[:description] = t_type
+        v[:values] << text.text
+      end
+      (other_text / 'TextLink').each do |link|
+        v = @lists[:text][t_type_code].dup
+        v[:description] = t_type
+        v[:values] << link.text
+      end
+    end
+    @lists[:text]
   end
 
 end
